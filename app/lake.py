@@ -52,7 +52,21 @@ INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
 
 SCHEMA_VERSION_KEY = "schema_version"
+EVENT_JOURNAL_START_KEY = "event_journal_start"
+EVENT_JOURNAL_START_AT_KEY = "event_journal_start_at"
 UPLOAD_METADATA_PREFIX = b"metlake."
+
+# 变更事件订阅（append-only journal）
+EVENT_DEFAULT_LIMIT = 50
+EVENT_MAX_LIMIT = 200
+CURSOR_RE = re.compile(r"^\d+$")
+EVENT_LABELS = {
+    "field_added": "新增字段",
+    "field_renamed": "字段改名",
+    "field_deleted": "删除字段",
+    "batch_registered": "批次登记",
+}
+EVENT_TYPES = frozenset(EVENT_LABELS)
 
 
 class LakeError(Exception):
@@ -93,6 +107,11 @@ class StorageError(LakeError):
 class BatchIntegrityError(LakeError):
     status_code = 500
     code = "integrity_error"
+
+
+class InvalidCursor(LakeError):
+    status_code = 400
+    code = "invalid_cursor"
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +215,38 @@ class IntegrityReport:
     hash_mismatches: tuple[str, ...]
     orphan_files: tuple[str, ...]
     temp_files: tuple[str, ...]
+    event_gaps: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChangeEvent:
+    """一条已提交的变更事件；``id`` 永久单调递增，就是分页游标。"""
+
+    id: int
+    type: str
+    schema_version: int
+    created_at: str
+    field_id: str | None
+    field_name: str | None
+    old_name: str | None
+    new_name: str | None
+    structure_version: int | None
+    batch_id: str | None
+    batch_row_count: int | None
+    batch_file_name: str | None
+    batch_fields: tuple[dict, ...]
+    source: str | None
+
+
+@dataclass(frozen=True)
+class EventPage:
+    events: tuple[ChangeEvent, ...]
+    next_cursor: str
+    has_more: bool
+    limit: int
+    journal_start_version: int = 0
+    latest_event_id: int = 0
+    total_events: int = 0
 
 
 # 仅测试使用：Parquet 已写完、数据库提交前的钩子。
@@ -294,6 +345,7 @@ def initialize(settings: Settings) -> None:
                 "CREATE INDEX IF NOT EXISTS ix_batches_created_at "
                 "ON batches(created_at DESC)"
             )
+            _init_event_journal(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '0')",
                 (SCHEMA_VERSION_KEY,),
@@ -319,6 +371,82 @@ def initialize(settings: Settings) -> None:
     raise StorageError(
         f"无法初始化数据库 {settings.db_path}：{last_error}"
     ) from last_error
+
+
+def _init_event_journal(conn: sqlite3.Connection) -> None:
+    """建事件表并记录订阅起点（幂等）。
+
+    事件表只追加：ID 由 SQLite AUTOINCREMENT 分配，永不回收、永不改写。
+    只有订阅启用之后的提交才写事件；升级前已存在的字段与批次**不补写**，
+    因为历史改名无法还原，补写会伪造“变更前名称”。``event_journal_start``
+    记录启用时的结构版本，订阅 API 会返回该边界。
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL CHECK (
+                type IN ('field_added', 'field_renamed',
+                         'field_deleted', 'batch_registered')
+            ),
+            schema_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            field_id TEXT,
+            field_name TEXT,
+            old_name TEXT,
+            new_name TEXT,
+            structure_version INTEGER,
+            batch_id TEXT,
+            batch_row_count INTEGER,
+            batch_file_name TEXT,
+            batch_fields_json TEXT,
+            source TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_events_schema_version "
+        "ON events(schema_version)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_events_batch_id ON events(batch_id)"
+    )
+    # 数据库层保证事件不可改写 / 不可删除，即使绕过应用代码也一样。
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_events_append_only_update
+        BEFORE UPDATE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'events are append-only');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_events_append_only_delete
+        BEFORE DELETE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'events are append-only');
+        END
+        """
+    )
+    if conn.execute(
+        "SELECT 1 FROM meta WHERE key = ?", (EVENT_JOURNAL_START_KEY,)
+    ).fetchone() is not None:
+        return
+    version_row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+    ).fetchone()
+    start_version = int(version_row["value"]) if version_row is not None else 0
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?, ?)",
+        (EVENT_JOURNAL_START_KEY, str(start_version)),
+    )
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?, ?)",
+        (EVENT_JOURNAL_START_AT_KEY, _utc_now_iso()),
+    )
 
 
 @contextmanager
@@ -431,6 +559,141 @@ def read_schema(settings: Settings) -> Schema:
 
 
 # ---------------------------------------------------------------------------
+# 变更事件订阅（游标分页）
+# ---------------------------------------------------------------------------
+
+
+def normalize_cursor(raw: object) -> int:
+    """游标 = 已消费的最后一条事件 ID；空值表示从头开始。"""
+
+    if raw is None:
+        return 0
+    text = str(raw).strip()
+    if not text:
+        return 0
+    if not CURSOR_RE.fullmatch(text):
+        raise InvalidCursor("游标必须是非负整数（上页返回的 next_cursor）。")
+    value = int(text)
+    if value < 0:
+        raise InvalidCursor("游标必须是非负整数。")
+    return value
+
+
+def normalize_limit(raw: object) -> int:
+    if raw is None or str(raw).strip() == "":
+        return EVENT_DEFAULT_LIMIT
+    text = str(raw).strip()
+    if not CURSOR_RE.fullmatch(text):
+        raise ValidationError("limit 必须是正整数。")
+    value = int(text)
+    if value < 1:
+        raise ValidationError("limit 必须是正整数。")
+    if value > EVENT_MAX_LIMIT:
+        raise ValidationError(f"limit 最大 {EVENT_MAX_LIMIT}。")
+    return value
+
+
+def _rows_to_event(row: sqlite3.Row) -> ChangeEvent:
+    try:
+        fields = tuple(json.loads(row["batch_fields_json"])) if row["batch_fields_json"] else ()
+    except (TypeError, ValueError):
+        fields = ()
+    return ChangeEvent(
+        id=int(row["id"]),
+        type=row["type"],
+        schema_version=int(row["schema_version"]),
+        created_at=row["created_at"],
+        field_id=row["field_id"],
+        field_name=row["field_name"],
+        old_name=row["old_name"],
+        new_name=row["new_name"],
+        structure_version=(
+            int(row["structure_version"])
+            if row["structure_version"] is not None
+            else None
+        ),
+        batch_id=row["batch_id"],
+        batch_row_count=(
+            int(row["batch_row_count"])
+            if row["batch_row_count"] is not None
+            else None
+        ),
+        batch_file_name=row["batch_file_name"],
+        batch_fields=fields,
+        source=row["source"],
+    )
+
+
+def read_event(settings: Settings, event_id: int) -> ChangeEvent:
+    if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 1:
+        raise NotFound("事件不存在。")
+    try:
+        with _read_transaction(settings) as conn:
+            row = conn.execute(
+                "SELECT id, type, schema_version, created_at, field_id, field_name, "
+                "old_name, new_name, structure_version, batch_id, batch_row_count, "
+                "batch_file_name, batch_fields_json, source FROM events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise StorageError("读取变更事件失败。") from exc
+    if row is None:
+        raise NotFound("事件不存在。")
+    return _rows_to_event(row)
+
+
+def read_events(
+    settings: Settings,
+    cursor: object = None,
+    limit: object = None,
+) -> EventPage:
+    """读取一段连续事件：只返回 id > cursor 的前 ``limit`` 条。
+
+    整个查询（含 next_cursor / latest_event_id）在一个读事务里完成，因此只会
+    看到已提交事件，不会出现空洞或半页。新提交的事件只会在后续页出现，已返回
+    事件不会被改写。``next_cursor`` 是本页最后一条事件的 ID，可直接作为下一页
+    的 ``cursor``；用旧游标重试是幂等的。
+    """
+
+    limit_value = normalize_limit(limit)
+    start = normalize_cursor(cursor)
+
+    try:
+        with _read_transaction(settings) as conn:
+            rows = conn.execute(
+                "SELECT id, type, schema_version, created_at, field_id, field_name, "
+                "old_name, new_name, structure_version, batch_id, batch_row_count, "
+                "batch_file_name, batch_fields_json, source FROM events "
+                "WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (start, limit_value + 1),
+            ).fetchall()
+            start_row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (EVENT_JOURNAL_START_KEY,),
+            ).fetchone()
+            latest_row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM events"
+            ).fetchone()
+            total_row = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()
+    except sqlite3.Error as exc:
+        raise StorageError("读取变更事件失败。") from exc
+
+    journal_start = int(start_row["value"]) if start_row is not None else 0
+    has_more = len(rows) > limit_value
+    events = tuple(_rows_to_event(r) for r in rows[:limit_value])
+    next_cursor = str(events[-1].id) if events else str(start)
+    return EventPage(
+        events=events,
+        next_cursor=next_cursor,
+        has_more=has_more,
+        limit=limit_value,
+        journal_start_version=journal_start,
+        latest_event_id=int(latest_row["m"]),
+        total_events=int(total_row["n"]),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 字段结构变更
 # ---------------------------------------------------------------------------
 
@@ -477,6 +740,65 @@ def _bump_version(conn: sqlite3.Connection, current: int) -> int:
     return new_version
 
 
+def _append_field_event(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    created_at: str,
+    field_id: str,
+    field_name: str,
+    structure_version: int,
+    old_name: str | None,
+    new_name: str | None,
+    source: str | None,
+) -> None:
+    """在调用方的事务内追加结构事件；与字段变更、版本号同生共死。"""
+
+    conn.execute(
+        "INSERT INTO events(type, schema_version, created_at, field_id, "
+        "field_name, old_name, new_name, structure_version, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_type,
+            structure_version,
+            created_at,
+            field_id,
+            field_name,
+            old_name,
+            new_name,
+            structure_version,
+            source,
+        ),
+    )
+
+
+def _append_batch_event(
+    conn: sqlite3.Connection,
+    *,
+    created_at: str,
+    schema_version: int,
+    batch_id: str,
+    row_count: int,
+    file_name: str,
+    schema_json: str,
+    source: str | None,
+) -> None:
+    conn.execute(
+        "INSERT INTO events(type, schema_version, created_at, batch_id, "
+        "batch_row_count, batch_file_name, batch_fields_json, source) "
+        "VALUES ('batch_registered', ?, ?, ?, ?, ?, ?, ?)",
+        (
+            schema_version,
+            created_at,
+            batch_id,
+            row_count,
+            file_name,
+            schema_json,
+            source,
+        ),
+    )
+
+
 def _next_ordinal(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT COALESCE(MAX(ordinal), -1) AS m FROM fields").fetchone()
     return int(row["m"]) + 1
@@ -504,7 +826,13 @@ def _utc_now_iso() -> str:
     )
 
 
-def add_field(settings: Settings, expected_version: int, raw_name: str) -> Schema:
+def add_field(
+    settings: Settings,
+    expected_version: int,
+    raw_name: str,
+    *,
+    source: str | None = None,
+) -> Schema:
     name = normalize_field_name(raw_name)
     try:
         with _write_transaction(settings) as conn:
@@ -518,17 +846,30 @@ def add_field(settings: Settings, expected_version: int, raw_name: str) -> Schem
                 )
             _ensure_name_free(conn, name)
             new_version = _bump_version(conn, version)
+            now = _utc_now_iso()
+            field_id = f"f_{uuid.uuid4().hex}"
             conn.execute(
                 "INSERT INTO fields(id, name, ordinal, status, created_version, "
                 "deleted_version, created_at, deleted_at) "
                 "VALUES (?, ?, ?, 'active', ?, NULL, ?, NULL)",
                 (
-                    f"f_{uuid.uuid4().hex}",
+                    field_id,
                     name,
                     _next_ordinal(conn),
                     new_version,
-                    _utc_now_iso(),
+                    now,
                 ),
+            )
+            _append_field_event(
+                conn,
+                event_type="field_added",
+                created_at=now,
+                field_id=field_id,
+                field_name=name,
+                structure_version=new_version,
+                old_name=None,
+                new_name=name,
+                source=source,
             )
     except LakeError:
         raise
@@ -538,7 +879,12 @@ def add_field(settings: Settings, expected_version: int, raw_name: str) -> Schem
 
 
 def rename_field(
-    settings: Settings, expected_version: int, field_id: str, raw_name: str
+    settings: Settings,
+    expected_version: int,
+    field_id: str,
+    raw_name: str,
+    *,
+    source: str | None = None,
 ) -> Schema:
     name = normalize_field_name(raw_name)
     try:
@@ -554,8 +900,20 @@ def rename_field(
                 raise ValidationError("新名称与当前名称相同。")
             _ensure_name_free(conn, name, exclude_id=field_id)
             new_version = _bump_version(conn, version)
+            now = _utc_now_iso()
             conn.execute(
                 "UPDATE fields SET name = ? WHERE id = ?", (name, field_id)
+            )
+            _append_field_event(
+                conn,
+                event_type="field_renamed",
+                created_at=now,
+                field_id=field_id,
+                field_name=name,
+                structure_version=new_version,
+                old_name=row["name"],
+                new_name=name,
+                source=source,
             )
             log.info("renamed %s -> %s at v%s", field_id, name, new_version)
     except LakeError:
@@ -565,21 +923,39 @@ def rename_field(
     return read_schema(settings)
 
 
-def delete_field(settings: Settings, expected_version: int, field_id: str) -> Schema:
+def delete_field(
+    settings: Settings,
+    expected_version: int,
+    field_id: str,
+    *,
+    source: str | None = None,
+) -> Schema:
     try:
         with _write_transaction(settings) as conn:
             version = _check_expected_version(conn, expected_version)
             row = conn.execute(
-                "SELECT id FROM fields WHERE id = ? AND status = 'active'",
+                "SELECT id, name FROM fields WHERE id = ? AND status = 'active'",
                 (field_id,),
             ).fetchone()
             if row is None:
                 raise NotFound("要删除的测量列不存在或已删除。")
             new_version = _bump_version(conn, version)
+            now = _utc_now_iso()
             conn.execute(
                 "UPDATE fields SET status = 'deleted', deleted_version = ?, "
                 "deleted_at = ? WHERE id = ?",
-                (new_version, _utc_now_iso(), field_id),
+                (new_version, now, field_id),
+            )
+            _append_field_event(
+                conn,
+                event_type="field_deleted",
+                created_at=now,
+                field_id=field_id,
+                field_name=row["name"],
+                structure_version=new_version,
+                old_name=row["name"],
+                new_name=None,
+                source=source,
             )
             log.info("deleted %s at v%s", field_id, new_version)
     except LakeError:
@@ -862,7 +1238,13 @@ def _write_parquet_atomic(
 # ---------------------------------------------------------------------------
 
 
-def upload_csv(settings: Settings, expected_version: int, data: bytes) -> Batch:
+def upload_csv(
+    settings: Settings,
+    expected_version: int,
+    data: bytes,
+    *,
+    source: str | None = None,
+) -> Batch:
     """解析并转换后，在最终提交前再次校验结构版本。
 
     转换/写文件期间不持有数据库写锁，因此结构仍可被另一进程修改；提交时
@@ -910,6 +1292,7 @@ def upload_csv(settings: Settings, expected_version: int, data: bytes) -> Batch:
             file_sha256=file_sha256,
             schema_json=schema_json,
             fields_at_upload=fields_at_upload,
+            source=source,
         )
     except BaseException:
         _safe_unlink(final_path)
@@ -931,6 +1314,7 @@ def _commit_batch(
     file_sha256: str,
     schema_json: str,
     fields_at_upload: Sequence[dict],
+    source: str | None = None,
 ) -> Batch:
     try:
         with _write_transaction(settings) as conn:
@@ -947,6 +1331,16 @@ def _commit_batch(
                     file_sha256,
                     schema_json,
                 ),
+            )
+            _append_batch_event(
+                conn,
+                created_at=created_at,
+                schema_version=expected_version,
+                batch_id=batch_id,
+                row_count=row_count,
+                file_name=file_name,
+                schema_json=schema_json,
+                source=source,
             )
     except LakeError:
         raise
@@ -983,6 +1377,35 @@ def get_batch(settings: Settings, batch_id: str) -> BatchView:
     physical = _read_physical_table(settings, batch)
     current = _materialize_current_table(physical, schema)
     return BatchView(schema=schema, batch=batch, table=current)
+
+
+def read_original_batch(settings: Settings, batch_id: str) -> tuple[Batch, bytes]:
+    """返回批次登记与**原始上传**的 Parquet 字节（物理列名 field_id，不重写）。"""
+
+    try:
+        with _read_transaction(settings) as conn:
+            row = conn.execute(
+                "SELECT id, created_at, schema_version, row_count, file_name, "
+                "file_sha256, schema_json FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise StorageError("读取批次失败。") from exc
+    if row is None:
+        raise NotFound("批次不存在。")
+    batch = _rows_to_batch(row)
+    path = settings.parquet_dir / batch.file_name
+    if not path.is_file():
+        raise BatchIntegrityError(
+            f"批次 {batch.id[:8]} 的原始 Parquet 文件缺失：{batch.file_name}"
+        )
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise BatchIntegrityError(
+            f"批次 {batch.id[:8]} 的原始 Parquet 无法读取。"
+        ) from exc
+    return batch, payload
 
 
 def _read_physical_table(settings: Settings, batch: Batch) -> pa.Table:
@@ -1102,11 +1525,80 @@ def sample_csv(schema: Schema, rows: int = 5) -> bytes:
     return out.getvalue().encode("utf-8")
 
 
+def check_event_integrity(settings: Settings) -> tuple[int, ...]:
+    """核对订阅启用后的结构版本 / 字段 / 批次都有对应事件。
+
+    返回缺失的结构版本列表；订阅启用前已存在的历史不参与核对。
+    """
+
+    try:
+        with _read_transaction(settings) as conn:
+            schema = _query_schema(conn)
+            start_row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (EVENT_JOURNAL_START_KEY,)
+            ).fetchone()
+            start_version = int(start_row["value"]) if start_row is not None else 0
+            start_at_row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (EVENT_JOURNAL_START_AT_KEY,),
+            ).fetchone()
+            start_at = start_at_row["value"] if start_at_row is not None else ""
+            batch_rows = conn.execute(
+                "SELECT id, schema_version, created_at FROM batches"
+            ).fetchall()
+            event_rows = conn.execute(
+                "SELECT type, structure_version, field_id, batch_id FROM events"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError("核对变更事件失败。") from exc
+
+    structure_versions = {
+        int(r["structure_version"])
+        for r in event_rows
+        if r["structure_version"] is not None
+    }
+    added_ids = {
+        r["field_id"]
+        for r in event_rows
+        if r["type"] == "field_added" and r["field_id"] is not None
+    }
+    deleted_versions = {
+        (r["field_id"], int(r["structure_version"]))
+        for r in event_rows
+        if r["type"] == "field_deleted" and r["field_id"] is not None
+    }
+    event_batch_ids = {r["batch_id"] for r in event_rows if r["batch_id"] is not None}
+
+    missing: list[int] = [
+        v
+        for v in range(start_version + 1, schema.version + 1)
+        if v not in structure_versions
+    ]
+    for field in schema.fields:
+        if field.created_version > start_version and field.id not in added_ids:
+            missing.append(field.created_version)
+        if (
+            field.deleted_version is not None
+            and field.deleted_version > start_version
+            and (field.id, field.deleted_version) not in deleted_versions
+        ):
+            missing.append(field.deleted_version)
+    for row in batch_rows:
+        # 订阅启用前入湖的批次不补写、也不核对；启用后入湖（版本更高或
+        # 入湖时间晚于起点）则必须有对应事件。
+        if int(row["schema_version"]) <= start_version and row["created_at"] <= start_at:
+            continue
+        if row["id"] not in event_batch_ids:
+            missing.append(int(row["schema_version"]))
+    return tuple(sorted(set(missing)))
+
+
 def check_integrity(settings: Settings) -> IntegrityReport:
     state = read_state(settings)
     registered = {b.file_name for b in state.batches}
     missing: list[str] = []
     mismatched: list[str] = []
+    event_gaps = check_event_integrity(settings)
     try:
         disk_files = {
             p.name for p in settings.parquet_dir.glob("*.parquet") if p.is_file()
@@ -1141,10 +1633,11 @@ def check_integrity(settings: Settings) -> IntegrityReport:
         except OSError:
             continue
     return IntegrityReport(
-        ok=not missing and not mismatched,
+        ok=not missing and not mismatched and not event_gaps,
         batches=len(state.batches),
         missing_files=tuple(missing),
         hash_mismatches=tuple(mismatched),
         orphan_files=tuple(orphans),
         temp_files=tuple(temp_files),
+        event_gaps=event_gaps,
     )

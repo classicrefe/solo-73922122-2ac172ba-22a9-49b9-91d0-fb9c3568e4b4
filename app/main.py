@@ -15,11 +15,13 @@ from fastapi.templating import Jinja2Templates
 
 from . import lake
 from .lake import (
+    EVENT_LABELS,
     MAX_FIELDS,
     MAX_ROWS,
     MAX_UPLOAD_BYTES,
     STATION_COLUMN,
     TIME_COLUMN,
+    ChangeEvent,
     LakeError,
     Settings,
 )
@@ -126,13 +128,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             kind=request.query_params.get("kind", "info"),
         )
 
+    @app.get("/changes", response_class=HTMLResponse)
+    def changes_page(request: Request):
+        q = request.query_params
+        page = lake.read_events(
+            resolved,
+            cursor=q.get("cursor"),
+            limit=q.get("limit"),
+        )
+        return _render(
+            request,
+            "changes.html",
+            settings=resolved,
+            page=page,
+            events=[_event_payload(e) for e in page.events],
+            cursor_input=(q.get("cursor") or ""),
+            msg=q.get("msg"),
+            kind=q.get("kind", "info"),
+        )
+
+    @app.get("/events/{event_id}", response_class=HTMLResponse)
+    def event_page(request: Request, event_id: int):
+        """事件详情：用于网页从事件跳到对应原始批次。"""
+
+        event = lake.read_event(resolved, event_id)
+        return _render(
+            request,
+            "event.html",
+            settings=resolved,
+            event=_event_payload(event),
+            ack=lake.read_schema(resolved).version,
+        )
+
     @app.post("/fields/add")
     def add_field_form(
         request: Request,
         version: int = Form(...),
         name: str = Form(...),
     ):
-        schema = lake.add_field(resolved, version, name)
+        schema = lake.add_field(
+            resolved, version, name, source=resolved.instance_name
+        )
         return _redirect_with_message(
             request, f"已新增测量列，结构已提交为 v{schema.version}。", "ok"
         )
@@ -144,14 +180,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version: int = Form(...),
         name: str = Form(...),
     ):
-        schema = lake.rename_field(resolved, version, field_id, name)
+        schema = lake.rename_field(
+            resolved, version, field_id, name, source=resolved.instance_name
+        )
         return _redirect_with_message(
             request, f"已改名，历史批次仍按旧列值展示；结构已提交为 v{schema.version}。", "ok"
         )
 
     @app.post("/fields/{field_id}/delete")
     def delete_field_form(request: Request, field_id: str, version: int = Form(...)):
-        schema = lake.delete_field(resolved, version, field_id)
+        schema = lake.delete_field(
+            resolved, version, field_id, source=resolved.instance_name
+        )
         return _redirect_with_message(
             request,
             f"已删除测量列（历史 Parquet 未改写）；结构已提交为 v{schema.version}。",
@@ -165,7 +205,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
     ):
         data = await _read_upload(file)
-        batch = lake.upload_csv(resolved, version, data)
+        batch = lake.upload_csv(
+            resolved, version, data, source=resolved.instance_name
+        )
         return _redirect_with_message(
             request,
             f"批次 {batch.short_id} 已入湖（{batch.row_count} 行，结构 v{batch.schema_version}）。",
@@ -228,7 +270,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = await _json_body(request)
         version = _payload_version(payload)
         name = payload.get("name")
-        schema = lake.add_field(resolved, version, name)
+        schema = lake.add_field(
+            resolved, version, name, source=resolved.instance_name
+        )
         return JSONResponse(_schema_payload(schema), status_code=201)
 
     @app.patch("/api/fields/{field_id}")
@@ -236,14 +280,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = await _json_body(request)
         version = _payload_version(payload)
         name = payload.get("name")
-        schema = lake.rename_field(resolved, version, field_id, name)
+        schema = lake.rename_field(
+            resolved, version, field_id, name, source=resolved.instance_name
+        )
         return _schema_payload(schema)
 
     @app.delete("/api/fields/{field_id}")
     async def api_delete_field(request: Request, field_id: str):
         payload = await _json_body(request)
         version = _payload_version(payload)
-        schema = lake.delete_field(resolved, version, field_id)
+        schema = lake.delete_field(
+            resolved, version, field_id, source=resolved.instance_name
+        )
         return _schema_payload(schema)
 
     @app.post("/api/batches")
@@ -253,7 +301,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
     ):
         data = await _read_upload(file)
-        batch = lake.upload_csv(resolved, version, data)
+        batch = lake.upload_csv(
+            resolved, version, data, source=resolved.instance_name
+        )
         return JSONResponse(_batch_payload(batch), status_code=201)
 
     @app.get("/api/batches/{batch_id}")
@@ -291,7 +341,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "hash_mismatches": list(report.hash_mismatches),
             "orphan_files": list(report.orphan_files),
             "temp_files": list(report.temp_files),
+            "event_gaps": list(report.event_gaps),
         }
+
+    # ------------------------------------------------------------------
+    # 变更事件订阅 API：游标分页，只返回已提交的连续事件
+    # ------------------------------------------------------------------
+
+    @app.get("/api/events")
+    def api_events(cursor: str | None = None, limit: str | None = None):
+        """按游标返回一段连续、已提交的事件。"""
+
+        page = lake.read_events(resolved, cursor=cursor, limit=limit)
+        return {
+            "events": [_event_payload(e) for e in page.events],
+            "next_cursor": page.next_cursor,
+            "has_more": page.has_more,
+            "limit": page.limit,
+            "journal_start_version": page.journal_start_version,
+            "latest_event_id": page.latest_event_id,
+            "total_events": page.total_events,
+        }
+
+    @app.get("/api/events/{event_id}")
+    def api_event(event_id: int):
+        return _event_payload(lake.read_event(resolved, event_id))
+
+    @app.get("/api/batches/{batch_id}/original")
+    def api_batch_original(batch_id: str):
+        """下载入湖时的原始 Parquet（物理列名为 field_id，未重写）。"""
+
+        batch, payload = lake.read_original_batch(resolved, batch_id)
+        return _download(
+            payload,
+            f"batch-{batch.short_id}-original.parquet",
+            "application/vnd.apache.parquet",
+        )
+
+    @app.get("/batches/{batch_id}/original.parquet")
+    def batch_original_page_download(batch_id: str):
+        batch, payload = lake.read_original_batch(resolved, batch_id)
+        return _download(
+            payload,
+            f"batch-{batch.short_id}-original.parquet",
+            "application/vnd.apache.parquet",
+        )
 
     return app
 
@@ -337,6 +431,7 @@ def resolved_settings(request: Request) -> Settings:
 
 _ERROR_TITLES = {
     "validation": "请求无效",
+    "invalid_cursor": "游标无效",
     "stale_schema": "结构版本已过期",
     "not_found": "未找到",
     "storage_error": "存储错误",
@@ -415,6 +510,30 @@ def _schema_payload(schema: lake.Schema) -> dict:
             for f in schema.deleted
         ],
     }
+
+
+def _event_payload(event: ChangeEvent) -> dict:
+    payload = {
+        "id": event.id,
+        "cursor": str(event.id),
+        "type": event.type,
+        "label": EVENT_LABELS.get(event.type, event.type),
+        "schema_version": event.schema_version,
+        "created_at": event.created_at,
+        "field_id": event.field_id,
+        "field_name": event.field_name,
+        "old_name": event.old_name,
+        "new_name": event.new_name,
+        "structure_version": event.structure_version,
+        "batch_id": event.batch_id,
+        "batch_row_count": event.batch_row_count,
+        "batch_fields": list(event.batch_fields),
+        "source": event.source,
+    }
+    if event.batch_id:
+        payload["original_parquet_url"] = f"/api/batches/{event.batch_id}/original"
+        payload["batch_url"] = f"/batches/{event.batch_id}"
+    return payload
 
 
 def _batch_payload(batch: lake.Batch) -> dict:

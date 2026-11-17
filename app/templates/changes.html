@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>变更订阅 · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>变更订阅</h1>
+  <span class="sub">按提交顺序的字段新增 / 改名 / 删除与批次登记</span>
+  <span class="instance">实例 {{ settings.instance_name }}</span>
+</header>
+
+<main>
+  <div class="crumbs">
+    <a href="/">← 返回数据湖</a>
+    <a href="/api/events?limit={{ page.limit }}">JSON API</a>
+  </div>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+
+  <section class="panel">
+    <h2>
+      游标订阅
+      <span class="badge">本页 {{ events|length }} 条</span>
+      <span class="hint">next_cursor = {{ page.next_cursor }}</span>
+    </h2>
+    <p class="hint" style="margin-top:-6px">
+      游标是“已读到的最后一条事件 ID”。断线后把 next_cursor 原样填回即可续读；
+      重试同一游标只会重新返回同一段事件，不会跳过任何一条。每页只包含连续、
+      已提交的事件，因此不会出现空洞。订阅自结构 v{{ page.journal_start_version }}
+      起生效，此前已有的结构与批次不会伪造事件。
+    </p>
+    <form class="stack-form" method="get" action="/changes">
+      <label class="inline-field">
+        cursor（续读游标，留空=从头）
+        <input type="text" name="cursor" value="{{ cursor_input }}" placeholder="例如 12" inputmode="numeric">
+      </label>
+      <label class="inline-field">
+        每页条数
+        <input type="text" name="limit" value="{{ page.limit }}" inputmode="numeric" size="4">
+      </label>
+      <button type="submit">读取</button>
+      <a class="button-link" href="/changes?cursor={{ page.next_cursor }}&limit={{ page.limit }}">从本页末条续读 →</a>
+    </form>
+    <div class="notice info">
+      分页在单个读事务内完成：同一页的事件与本页末条游标来自同一已提交快照；
+      新提交只会追加到后续页。翻页期间新增提交不会导致本页事件重复或缺失。
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>事件列表</h2>
+    {% if events %}
+    <table class="data events">
+      <thead>
+        <tr>
+          <th style="width:64px">事件</th>
+          <th style="width:110px">类型</th>
+          <th>字段 / 结构</th>
+          <th>批次</th>
+          <th>提交时间 (UTC)</th>
+          <th style="width:120px"></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for ev in events %}
+        <tr>
+          <td class="num"><a href="/events/{{ ev.id }}">#{{ ev.id }}</a></td>
+          <td><span class="badge {{ 'err' if ev.type == 'field_deleted' else ('ok' if ev.type == 'field_added' else 'gray') }}">{{ ev.label }}</span></td>
+          <td>
+            {% if ev.type == 'field_added' %}
+              <strong>{{ ev.new_name }}</strong>
+              <span class="muted">新增 · <code>{{ ev.field_id }}</code></span>
+            {% elif ev.type == 'field_renamed' %}
+              <code>{{ ev.old_name }}</code> → <strong>{{ ev.new_name }}</strong>
+              <span class="muted">· <code>{{ ev.field_id }}</code></span>
+            {% elif ev.type == 'field_deleted' %}
+              <strong>{{ ev.old_name }}</strong>
+              <span class="muted">删除 · 保留 ID <code>{{ ev.field_id }}</code></span>
+            {% else %}
+              <span class="muted">结构 v{{ ev.schema_version }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if ev.batch_id %}
+              <a href="/batches/{{ ev.batch_id }}"><code>{{ ev.batch_id[:8] }}</code></a>
+              <span class="muted">{{ ev.batch_row_count }} 行</span>
+              <div class="muted small">
+                {% if ev.batch_fields %}
+                  入湖字段：{{ ev.batch_fields|map(attribute='name')|join(', ') }}
+                {% else %}
+                  入湖时无测量列
+                {% endif %}
+              </div>
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+          </td>
+          <td class="num small">{{ ev.created_at }}</td>
+          <td>
+            <div class="row-actions">
+              <a href="/events/{{ ev.id }}">详情</a>
+              {% if ev.batch_id %}
+              <a href="/api/batches/{{ ev.batch_id }}/original">原始 Parquet</a>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">此游标之后没有更多事件。</p>
+    {% endif %}
+    <div class="downloads">
+      {% if page.has_more %}
+      <a href="/changes?cursor={{ page.next_cursor }}&limit={{ page.limit }}">下一页（{{ events|length }} 条）→</a>
+      {% endif %}
+      <a href="/changes?limit={{ page.limit }}">从头查看</a>
+      <a href="/api/events?cursor={{ page.next_cursor }}&limit={{ page.limit }}">本页 JSON</a>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 事件与对应的结构变更 / 批次登记在同一事务提交，重启后仍可续读。
+</footer>
+</body>
+</html>

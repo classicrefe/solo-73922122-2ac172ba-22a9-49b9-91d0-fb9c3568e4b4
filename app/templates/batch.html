@@ -36,7 +36,12 @@
     <div class="downloads">
       <a href="/batches/{{ batch.id }}/download.csv">下载当前列名 CSV</a>
       <a href="/batches/{{ batch.id }}/download.parquet">下载当前列名 Parquet</a>
+      <a href="/batches/{{ batch.id }}/original.parquet">下载入湖原始 Parquet</a>
       <a href="/api/batches/{{ batch.id }}">JSON</a>
+    </div>
+    <div class="notice info">
+      原始 Parquet 是入湖时写下的字节（物理列名为永久 field_id，SHA-256 {{ batch.file_sha256[:16] }}…）；
+      “当前列名”下载按本页快照投影，不会改写原件。
     </div>
   </section>
 

@@ -216,6 +216,92 @@ def main() -> None:
         check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 2, integrity)
         page = httpx.get(f"{B}/")
         check("网页可打开展示过期提示", page.status_code == 200)
+
+        # 8. 变更订阅：A、B 看到同一份事件；游标分页连续、可重试、可续读
+        events_a = httpx.get(f"{A}/api/events", params={"cursor": 0, "limit": 200}).json()
+        events_b = httpx.get(f"{B}/api/events", params={"cursor": 0, "limit": 200}).json()
+        check("两个实例事件视图一致", events_a["events"] == events_b["events"])
+        all_events = events_a["events"]
+        types_ = [e["type"] for e in all_events]
+        check(
+            "事件按提交顺序覆盖字段新增/改名/删除与批次登记",
+            types_ == [
+                "field_added",
+                "field_added",
+                "batch_registered",
+                "field_added",
+                "field_renamed",
+                "field_deleted",
+                "field_added",
+                "batch_registered",
+            ],
+            types_,
+        )
+        check(
+            "事件 ID 严格递增且永久",
+            [e["id"] for e in all_events] == list(range(1, len(all_events) + 1)),
+        )
+
+        # 从 A 起第一页、在 B 提交新变更、再用游标续读：不漏不重
+        first = httpx.get(f"{A}/api/events", params={"cursor": 0, "limit": 2}).json()
+        more = httpx.post(
+            f"{B}/api/fields",
+            json={"schema_version": httpx.get(f"{B}/api/schema").json()["schema_version"],
+                  "name": "visibility_km"},
+        )
+        check("分页期间在 B 提交新结构", more.status_code == 201, more.text[:120])
+        second = httpx.get(
+            f"{A}/api/events",
+            params={"cursor": first["next_cursor"], "limit": 200},
+        ).json()
+        ids = [e["id"] for e in first["events"]] + [e["id"] for e in second["events"]]
+        check("续读无空洞、无重复", ids == sorted(set(ids)) and ids[0] == 1, ids)
+        check(
+            "新提交只出现在后续页且事件尾随",
+            ids[-1] == len(ids) and second["events"][-1]["type"] == "field_added",
+            second["events"][-1],
+        )
+        retry = httpx.get(
+            f"{A}/api/events",
+            params={"cursor": first["next_cursor"], "limit": 200},
+        ).json()
+        check("旧游标重试返回同一段事件", retry["events"] == second["events"])
+
+        # 批次事件携带入湖字段 ID/名称与原始 Parquet 下载入口
+        batch_event = next(
+            e for e in second["events"] + first["events"] if e["batch_id"]
+        )
+        check(
+            "批次事件含入湖字段与原始下载入口",
+            bool(batch_event["batch_fields"])
+            and batch_event["original_parquet_url"].endswith("/original"),
+            batch_event["batch_fields"],
+        )
+        original = httpx.get(f"{A}{batch_event['original_parquet_url']}")
+        expected_path = data_dir / "parquet" / (
+            batch_event["original_parquet_url"].split("/")[-2] + ".parquet"
+        )
+        check(
+            "原始 Parquet 下载字节与文件一致",
+            original.status_code == 200
+            and original.content == expected_path.read_bytes(),
+        )
+        view = httpx.get(f"{A}/api/batches/{batch_event['batch_id']}").json()
+        check(
+            "按当前列名下载行为保持不变",
+            httpx.get(f"{A}/api/batches/{batch_event['batch_id']}?format=parquet").status_code
+            == 200
+            and view["batch"]["id"] == batch_event["batch_id"],
+        )
+
+        changes_page = httpx.get(f"{B}/changes?cursor=0&limit=2")
+        check(
+            "变更订阅网页可打开并给出续读游标",
+            changes_page.status_code == 200
+            and first["next_cursor"] in changes_page.text,
+        )
+        detail = httpx.get(f"{A}/events/1")
+        check("事件详情网页可打开", detail.status_code == 200)
         print("\n全部端到端检查通过。")
     finally:
         for path in stops:

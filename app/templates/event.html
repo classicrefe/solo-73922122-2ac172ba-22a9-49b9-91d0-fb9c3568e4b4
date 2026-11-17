@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>事件 #{{ event.id }} · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>变更事件 #{{ event.id }}</h1>
+  <span class="sub">{{ event.label }}</span>
+  <span class="instance">实例 {{ settings.instance_name }}</span>
+</header>
+
+<main>
+  <div class="crumbs">
+    <a href="/changes?cursor={{ event.id }}">← 从该事件之后继续订阅</a>
+    <a href="/">数据湖</a>
+  </div>
+
+  <section class="panel">
+    <h2>
+      事件信息
+      <span class="badge">{{ event.label }}</span>
+      <span class="hint">永久 ID #{{ event.id }}</span>
+    </h2>
+    <dl class="meta">
+      <dt>事件 ID</dt><dd>{{ event.id }}</dd>
+      <dt>类型</dt><dd>{{ event.type }}</dd>
+      <dt>提交时间</dt><dd>{{ event.created_at }}</dd>
+      <dt>来源实例</dt><dd>{{ event.source or "—" }}</dd>
+      <dt>登记时结构</dt><dd>v{{ event.schema_version }}</dd>
+      {% if event.structure_version is not none %}<dt>结构版本</dt><dd>v{{ event.structure_version }}</dd>{% endif %}
+      {% if event.field_id %}<dt>字段 ID</dt><dd>{{ event.field_id }}</dd>{% endif %}
+      {% if event.type == 'field_renamed' %}
+        <dt>变更前名称</dt><dd>{{ event.old_name }}</dd>
+        <dt>变更后名称</dt><dd>{{ event.new_name }}</dd>
+      {% elif event.type == 'field_deleted' %}
+        <dt>删除前名称</dt><dd>{{ event.old_name }}</dd>
+      {% elif event.type == 'field_added' %}
+        <dt>字段名称</dt><dd>{{ event.new_name }}</dd>
+      {% endif %}
+    </dl>
+    <div class="notice info">
+      事件一旦提交就不可改写：之后改名、删除或同名重建都不会改变本事件的字段 ID、
+      变更前后名称与结构版本；对应历史 Parquet 也不会被重写。
+    </div>
+  </section>
+
+  {% if event.batch_id %}
+  <section class="panel">
+    <h2>
+      对应批次登记
+      <span class="badge gray">{{ event.batch_id[:8] }}</span>
+    </h2>
+    <dl class="meta">
+      <dt>批次 ID</dt><dd>{{ event.batch_id }}</dd>
+      <dt>入湖行数</dt><dd>{{ event.batch_row_count }}</dd>
+      <dt>入湖时结构</dt><dd>v{{ event.schema_version }}</dd>
+      <dt>入湖时字段</dt>
+      <dd>
+        {% if event.batch_fields %}
+          {% for f in event.batch_fields %}<code>{{ f.name }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+        {% else %}（无测量列）{% endif %}
+      </dd>
+    </dl>
+    <div class="downloads">
+      <a href="/api/batches/{{ event.batch_id }}/original">下载原始 Parquet（入湖时物理列）</a>
+      <a href="/api/batches/{{ event.batch_id }}?format=parquet">下载当前列名 Parquet</a>
+      <a href="/batches/{{ event.batch_id }}">打开批次页</a>
+    </div>
+    <div class="notice">
+      原始 Parquet 是入湖时写下的字节（物理列名为永久 field_id），仅提供原样下载；
+      “当前列名”下载仍按页面所用已提交结构投影，不改写原件。
+    </div>
+  </section>
+  {% endif %}
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 展示快照 v{{ ack }}
+</footer>
+</body>
+</html>

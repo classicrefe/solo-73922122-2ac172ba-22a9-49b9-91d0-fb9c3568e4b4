@@ -378,6 +378,7 @@ def test_write_failure_keeps_existing_batches(client: TestClient, settings: Sett
     def boom(*args, **kwargs):
         raise OSError("disk full")
 
+    real_write = pq.write_table
     monkeypatch.setattr(lake.pq, "write_table", boom)
     try:
         failed = client.post(
@@ -386,7 +387,7 @@ def test_write_failure_keeps_existing_batches(client: TestClient, settings: Sett
             files={"file": ("b.csv", simple_csv(temp_c=2), "text/csv")},
         )
     finally:
-        monkeypatch.setattr(lake.pq, "write_table", pq.write_table)
+        monkeypatch.setattr(lake.pq, "write_table", real_write)
     assert failed.status_code == 500
     after = current(client)
     assert after["batches"] == before["batches"]
@@ -699,3 +700,538 @@ def test_two_processes_share_state_and_reject_stale_writes(dual_instances):
     assert stale.status_code == 409
     assert len(httpx.get(f"{b}/api/state").json()["batches"]) == 1
     assert len(list((data_dir / "parquet").glob("*.parquet"))) == 1
+
+    # 两个真实进程看到同一份只追加事件；过期上传没有留下事件
+    events_a = httpx.get(f"{a}/api/events?cursor=0&limit=100").json()
+    events_b = httpx.get(f"{b}/api/events?cursor=0&limit=100").json()
+    assert events_a["events"] == events_b["events"]
+    assert [e["type"] for e in events_a["events"]] == [
+        "field_added",
+        "field_added",
+        "batch_registered",
+    ]
+    assert events_a["events"][-1]["batch_id"] == batch_id
+    assert events_a["next_cursor"] == "3"
+
+    # 在 A 翻页中途由 B 提交，再用游标从 A 续读：无空洞、无重复
+    page1 = httpx.get(f"{a}/api/events?cursor=0&limit=2").json()
+    assert [e["id"] for e in page1["events"]] == [1, 2]
+    created = httpx.post(
+        f"{b}/api/fields",
+        json={"schema_version": 2, "name": "wind_ms"},
+    )
+    assert created.status_code == 201, created.text
+    rest = httpx.get(f"{a}/api/events?cursor={page1['next_cursor']}&limit=100").json()
+    assert [e["id"] for e in rest["events"]] == [3, 4]
+    assert rest["events"][0]["batch_id"] == batch_id
+    assert rest["events"][1]["type"] == "field_added"
+    retry = httpx.get(f"{a}/api/events?cursor={page1['next_cursor']}&limit=100").json()
+    assert retry["events"] == rest["events"]
+
+    # 原始下载在 B 上同样可用且字节一致
+    original = httpx.get(f"{b}/api/batches/{batch_id}/original")
+    assert original.status_code == 200
+    assert original.content == (data_dir / "parquet" / f"{batch_id}.parquet").read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# 变更事件订阅：永久 ID、游标分页、原子性与续读
+# ---------------------------------------------------------------------------
+
+
+def event_ids(resp: httpx.Response) -> list[int]:
+    assert resp.status_code == 200, resp.text
+    return [e["id"] for e in resp.json()["events"]]
+
+
+def page_through(client: TestClient, limit: int = 2) -> tuple[list[dict], list[str]]:
+    """按 next_cursor 一页页读到 has_more=False，返回全部事件与每页游标。"""
+
+    events: list[dict] = []
+    cursors: list[str] = []
+    cursor = ""
+    while True:
+        resp = client.get("/api/events", params={"cursor": cursor, "limit": limit})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["events"]) <= limit
+        events.extend(body["events"])
+        cursors.append(body["next_cursor"])
+        if not body["has_more"]:
+            return events, cursors
+        cursor = body["next_cursor"]
+
+
+def test_event_journal_records_all_changes_in_commit_order(client: TestClient):
+    add(client, "temp_c")  # event 1, v1
+    add(client, "humidity")  # event 2, v2
+    field_id = current(client)["schema"]["fields"][0]["id"]
+    v = current(client)["schema"]["schema_version"]
+    assert client.patch(
+        f"/api/fields/{field_id}", json={"schema_version": v, "name": "temperature_c"}
+    ).status_code == 200  # event 3, v3
+    up = client.post(
+        "/api/batches",
+        data={"version": 3},
+        files={"file": ("a.csv", simple_csv(temperature_c=5), "text/csv")},
+    )
+    assert up.status_code == 201, up.text
+    v = current(client)["schema"]["schema_version"]
+    assert client.request(
+        "DELETE", f"/api/fields/{field_id}", json={"schema_version": v}
+    ).status_code == 200  # event 5, v4
+
+    events, cursors = page_through(client, limit=2)
+    assert [e["type"] for e in events] == [
+        "field_added",
+        "field_added",
+        "field_renamed",
+        "batch_registered",
+        "field_deleted",
+    ]
+    assert [e["id"] for e in events] == [1, 2, 3, 4, 5]
+    assert cursors == ["2", "4", "5"]
+
+    assert events[0]["new_name"] == "temp_c" and events[0]["structure_version"] == 1
+    renamed = events[2]
+    assert renamed["field_id"] == field_id
+    assert renamed["old_name"] == "temp_c"
+    assert renamed["new_name"] == "temperature_c"
+    assert renamed["structure_version"] == 3
+
+    deleted = events[4]
+    assert deleted["field_id"] == field_id
+    assert deleted["old_name"] == "temperature_c"
+    assert deleted["new_name"] is None
+    assert deleted["structure_version"] == 4
+
+    batch_event = events[3]
+    assert batch_event["batch_id"] == up.json()["id"]
+    assert batch_event["batch_row_count"] == 1
+    assert batch_event["schema_version"] == 3
+    # 批次事件带上入湖时字段的永久 ID 与名称
+    upload_view = client.get(f"/api/batches/{up.json()['id']}").json()
+    assert batch_event["batch_fields"] == upload_view["batch"]["fields_at_upload"]
+    assert [f["name"] for f in batch_event["batch_fields"]] == [
+        "temperature_c",
+        "humidity",
+    ]
+    assert [f["ordinal"] for f in batch_event["batch_fields"]] == [0, 1]
+    assert batch_event["original_parquet_url"] == f"/api/batches/{up.json()['id']}/original"
+
+
+def test_event_ids_are_permanent_across_rename_delete_and_readd(client: TestClient):
+    add(client, "temp_c")
+    old_id = current(client)["schema"]["fields"][0]["id"]
+    v = current(client)["schema"]["schema_version"]
+    client.patch(
+        f"/api/fields/{old_id}", json={"schema_version": v, "name": "temp_air"}
+    )
+    v = current(client)["schema"]["schema_version"]
+    client.request("DELETE", f"/api/fields/{old_id}", json={"schema_version": v})
+    v = current(client)["schema"]["schema_version"]
+    readd = client.post("/api/fields", json={"schema_version": v, "name": "temp_c"})
+    assert readd.status_code == 201, readd.text
+    new_id = readd.json()["fields"][0]["id"]
+    assert new_id != old_id
+
+    events, _ = page_through(client, limit=10)
+    first = events[0]
+    renamed = events[1]
+    deleted = events[2]
+    readded = events[3]
+
+    # 旧事件一律不变
+    assert first["field_id"] == old_id
+    assert first["new_name"] == "temp_c"
+    assert renamed["old_name"] == "temp_c" and renamed["new_name"] == "temp_air"
+    assert deleted["field_id"] == old_id and deleted["old_name"] == "temp_air"
+    assert deleted["new_name"] is None
+    # 同名重建是新事件、新 field_id，不能改写旧事件
+    assert readded["field_id"] == new_id and readded["new_name"] == "temp_c"
+    assert all(e["id"] < readded["id"] for e in (first, renamed, deleted))
+
+
+def test_event_cursor_pagination_is_gapless_under_concurrent_commits(
+    settings: Settings,
+):
+    """翻页期间有新提交：既不漏事件，也不重复、不改写已返回事件。"""
+
+    for name in ("a", "b", "c"):
+        lake.add_field(settings, lake.read_schema(settings).version, name)
+    seen: list[int] = []
+    cursor = ""
+    pages = 0
+    while True:
+        page = lake.read_events(settings, cursor=cursor, limit=1)
+        pages += 1
+        seen.extend(e.id for e in page.events)
+        cursor = page.next_cursor
+        # 每翻一页后，另一“实例”提交一条新结构变更
+        if pages <= 3:
+            lake.add_field(
+                settings, lake.read_schema(settings).version, f"late{pages}"
+            )
+        if not page.has_more:
+            break
+    # 最终应看到全部 3 + 3 条事件，且严格递增无重复
+    all_ids = [e.id for e in lake.read_events(settings, limit=200).events]
+    assert seen == all_ids
+    assert len(seen) == 6
+    assert seen == sorted(set(seen))
+
+    # 用旧游标重试：返回相同的后续事件，不会跳过
+    retry_from_third = lake.read_events(settings, cursor=str(seen[2]), limit=2)
+    assert [e.id for e in retry_from_third.events] == seen[3:5]
+    # 重复请求同一页完全幂等
+    again = lake.read_events(settings, cursor=str(seen[2]), limit=2)
+    assert again.events == retry_from_third.events
+
+
+def test_event_cursor_rejects_invalid_values(client: TestClient):
+    add(client, "temp_c")
+    for bad in ("-1", "abc", "1.5", "1e3"):
+        resp = client.get("/api/events", params={"cursor": bad})
+        assert resp.status_code == 400, (bad, resp.text)
+        assert resp.json()["error"] == "invalid_cursor"
+    for bad in ("0", "-2", "x", str(999)):
+        resp = client.get("/api/events", params={"limit": bad})
+        assert resp.status_code == 400, (bad, resp.text)
+
+
+def test_event_page_is_single_snapshot_while_writer_commits(
+    settings: Settings,
+):
+    """读事务进行中提交的新事件不会混入本页或造成空洞。"""
+
+    for name in ("a", "b", "c", "d"):
+        lake.add_field(settings, lake.read_schema(settings).version, name)
+
+    page = lake.read_events(settings, cursor="0", limit=3)
+    assert [e.id for e in page.events] == [1, 2, 3]
+    assert page.has_more is True
+    assert page.next_cursor == "3"
+
+    # 页边界之后的新提交只能出现在后续页
+    lake.add_field(settings, lake.read_schema(settings).version, "e")
+    rest = lake.read_events(settings, cursor=page.next_cursor, limit=10)
+    assert [e.id for e in rest.events] == [4, 5]
+    assert rest.has_more is False
+
+
+def test_event_and_batch_registration_are_atomic(
+    client: TestClient, settings: Settings, monkeypatch
+):
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    before = lake.read_events(settings, limit=100).events
+    assert [e.type for e in before] == ["field_added"]
+
+    def fail(*args, **kwargs):
+        raise lake.StorageError("登记失败（模拟）")
+
+    monkeypatch.setattr(lake, "_commit_batch", fail)
+    try:
+        resp = client.post(
+            "/api/batches",
+            data={"version": v},
+            files={"file": ("a.csv", simple_csv(temp_c=1), "text/csv")},
+        )
+    finally:
+        monkeypatch.setattr(lake, "_commit_batch", lake._commit_batch)
+    assert resp.status_code == 500
+    assert [e.type for e in lake.read_events(settings, limit=100).events] == [
+        "field_added"
+    ]
+    assert list(settings.parquet_dir.glob("*.parquet")) == []
+
+
+def test_event_and_schema_change_are_atomic_on_failure(
+    client: TestClient, settings: Settings, monkeypatch
+):
+    add(client, "temp_c")
+    field_id = current(client)["schema"]["fields"][0]["id"]
+    v = current(client)["schema"]["schema_version"]
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    real_append = lake._append_field_event
+    monkeypatch.setattr(lake, "_append_field_event", boom)
+    try:
+        resp = client.patch(
+            f"/api/fields/{field_id}",
+            json={"schema_version": v, "name": "temperature_c"},
+        )
+    finally:
+        monkeypatch.setattr(lake, "_append_field_event", real_append)
+    assert resp.status_code == 500
+    # 结构版本、字段名、事件都必须一起回滚
+    assert current(client)["schema"]["schema_version"] == v
+    assert current(client)["schema"]["fields"][0]["name"] == "temp_c"
+    assert [e.type for e in lake.read_events(settings, limit=100).events] == [
+        "field_added"
+    ]
+
+
+def test_event_subscription_pages_and_original_download(client: TestClient):
+    page = client.get("/changes")
+    assert page.status_code == 200
+    assert "变更订阅" in page.text
+    assert "next_cursor" in page.text
+
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    batch = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": ("a.csv", simple_csv(temp_c=9), "text/csv")},
+    ).json()
+
+    page2 = client.get("/changes?cursor=0&limit=1")
+    assert page2.status_code == 200
+    assert 'value="0"' in page2.text
+    # 有下一页时页面给出续读链接
+    assert "cursor=1" in page2.text
+
+    # 整页渲染包含批次事件：显示入湖字段名、批次链接与原始下载入口
+    full = client.get("/changes?cursor=0&limit=100")
+    assert full.status_code == 200
+    assert "temp_c" in full.text
+    assert batch["id"][:8] in full.text
+    assert f"/api/batches/{batch['id']}/original" in full.text
+    assert "下一页" not in full.text  # 已无更多事件
+
+    empty = client.get("/changes?cursor=999")
+    assert empty.status_code == 200
+    assert "没有更多事件" in empty.text
+
+    detail = client.get("/events/2")
+    assert detail.status_code == 200
+    assert batch["id"] in detail.text
+    assert f"/api/batches/{batch['id']}/original" in detail.text
+
+    original = client.get(f"/api/batches/{batch['id']}/original")
+    assert original.status_code == 200
+    assert original.content == (
+        client.app.state.settings.parquet_dir / batch["file_name"]
+    ).read_bytes()
+    # 原始文件物理列名是永久 field_id
+    import pyarrow.parquet as pq
+    import io as _io
+
+    table = pq.read_table(_io.BytesIO(original.content))
+    assert lake.STATION_COLUMN in table.column_names
+    assert "temp_c" not in table.column_names
+    assert any(name.startswith("f_") for name in table.column_names)
+
+    # 按当前列名下载的行为保持不变
+    current_dl = client.get(f"/api/batches/{batch['id']}?format=parquet")
+    assert current_dl.status_code == 200
+    current_table = pq.read_table(_io.BytesIO(current_dl.content))
+    assert "temp_c" in current_table.column_names
+
+    assert client.get("/events/999").status_code == 404
+    assert client.get("/api/events/999").status_code == 404
+
+
+def test_original_download_unchanged_after_rename_and_delete(
+    client: TestClient, settings: Settings
+):
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    batch = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": ("a.csv", simple_csv(temp_c=3), "text/csv")},
+    ).json()
+    before = client.get(f"/api/batches/{batch['id']}/original").content
+    field_id = current(client)["schema"]["fields"][0]["id"]
+
+    v = current(client)["schema"]["schema_version"]
+    client.patch(
+        f"/api/fields/{field_id}", json={"schema_version": v, "name": "temp_air"}
+    )
+    v = current(client)["schema"]["schema_version"]
+    client.request("DELETE", f"/api/fields/{field_id}", json={"schema_version": v})
+
+    after = client.get(f"/api/batches/{batch['id']}/original")
+    assert after.status_code == 200
+    assert after.content == before
+    assert file_digest(settings.parquet_dir / batch["file_name"])[0] == batch["file_sha256"]
+
+    # 事件里的字段名仍是登记时的值
+    events = lake.read_events(settings, limit=100).events
+    batch_event = next(e for e in events if e.type == "batch_registered")
+    assert batch_event.batch_fields[0]["name"] == "temp_c"
+
+
+def test_events_survive_restart(settings: Settings):
+    app = create_app(settings)
+    with TestClient(app) as c:
+        add(c, "temp_c")
+        v = current(c)["schema"]["schema_version"]
+        c.post(
+            "/api/batches",
+            data={"version": v},
+            files={"file": ("a.csv", simple_csv(temp_c=1), "text/csv")},
+        )
+        first_page = lake.read_events(settings, limit=1)
+        assert first_page.next_cursor == "1"
+
+    restarted = TestClient(create_app(Settings(data_dir=settings.data_dir, instance_name="again")))
+    with restarted:
+        # 从旧游标继续读，重启后事件与游标都还在
+        payload = restarted.get("/api/events?cursor=1&limit=10").json()
+        assert [e["type"] for e in payload["events"]] == ["batch_registered"]
+        assert restarted.get("/api/events?cursor=0&limit=10").json()["next_cursor"] == "2"
+        assert restarted.get("/api/integrity").json()["event_gaps"] == []
+
+
+def test_legacy_database_starts_journal_at_current_version(tmp_path: Path):
+    """升级前已有结构与批次：不伪造历史事件，只在启用后记录。"""
+
+    data_dir = tmp_path / "legacy"
+    settings = Settings(data_dir=data_dir, instance_name="legacy")
+    settings.ensure_dirs()
+    conn = sqlite3.connect(settings.db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '2')")
+    conn.execute(
+        "CREATE TABLE fields (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "ordinal INTEGER NOT NULL, status TEXT NOT NULL, created_version INTEGER NOT NULL, "
+        "deleted_version INTEGER, created_at TEXT NOT NULL, deleted_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO fields VALUES ('f_' || replace(hex(zeroblob(16)), '00', 'a'), "
+        "'temp_c', 0, 'active', 1, NULL, '2026-01-01T00:00:00Z', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO fields VALUES ('f_' || replace(hex(zeroblob(16)), '00', 'b'), "
+        "'wind', 1, 'deleted', 1, 2, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')"
+    )
+    conn.execute(
+        "CREATE TABLE batches (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, "
+        "schema_version INTEGER NOT NULL, row_count INTEGER NOT NULL, "
+        "file_name TEXT NOT NULL UNIQUE, file_sha256 TEXT NOT NULL, "
+        "schema_json TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO batches VALUES ('legacybatch', '2026-01-03T00:00:00Z', 2, 1, "
+        "'legacybatch.parquet', 'x', '[]')"
+    )
+    conn.close()
+
+    lake.initialize(settings)
+    page = lake.read_events(settings, limit=100)
+    assert page.events == ()
+    assert page.journal_start_version == 2
+    assert page.next_cursor == "0"
+    assert lake.check_integrity(settings).event_gaps == ()
+
+    # 启用后的提交才开始有事件，ID 从 1 起
+    legacy_field = next(f for f in lake.read_schema(settings).fields if f.name == "temp_c")
+    schema = lake.rename_field(settings, 2, legacy_field.id, "temp_air")
+    assert schema.version == 3
+    page = lake.read_events(settings, limit=100)
+    assert [(e.id, e.type, e.new_name) for e in page.events] == [
+        (1, "field_renamed", "temp_air")
+    ]
+    assert page.journal_start_version == 2
+    assert lake.check_integrity(settings).event_gaps == ()
+
+    # 再次启动不会重写起点，也不会重复事件
+    lake.initialize(settings)
+    assert [e.id for e in lake.read_events(settings, limit=100).events] == [1]
+    assert lake.read_events(settings, limit=1).journal_start_version == 2
+
+
+def test_batch_registered_after_enable_at_same_schema_version_is_checked(tmp_path: Path):
+    """启用订阅后、结构版本未变时入湖的批次也必须有事件（不能漏检）。"""
+
+    settings = Settings(data_dir=tmp_path / "samever", instance_name="legacy")
+    settings.ensure_dirs()
+    conn = sqlite3.connect(settings.db_path, isolation_level=None)
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '0')")
+    conn.execute(
+        "CREATE TABLE fields (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "ordinal INTEGER NOT NULL, status TEXT NOT NULL, created_version INTEGER NOT NULL, "
+        "deleted_version INTEGER, created_at TEXT NOT NULL, deleted_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE batches (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, "
+        "schema_version INTEGER NOT NULL, row_count INTEGER NOT NULL, "
+        "file_name TEXT NOT NULL UNIQUE, file_sha256 TEXT NOT NULL, "
+        "schema_json TEXT NOT NULL)"
+    )
+    conn.close()
+
+    lake.initialize(settings)  # 订阅自 v0 起
+    batch = lake.upload_csv(
+        settings, 0, simple_csv()
+    )
+    assert lake.check_integrity(settings).event_gaps == ()
+
+    # 事件在数据库层只追加：直接 UPDATE / DELETE 都会被拒绝
+    conn = sqlite3.connect(settings.db_path, isolation_level=None)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE events SET new_name = 'x' WHERE batch_id = ?", (batch.id,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM events WHERE batch_id = ?", (batch.id,))
+    # 去掉触发器后人为删掉批次事件，自检必须发现
+    conn.execute("DROP TRIGGER trg_events_append_only_delete")
+    conn.execute("DELETE FROM events WHERE batch_id = ?", (batch.id,))
+    conn.close()
+    gaps = lake.check_integrity(settings).event_gaps
+    assert 0 in gaps
+
+
+def test_stale_upload_and_disk_failure_leave_no_event(
+    client: TestClient, settings: Settings, monkeypatch
+):
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    baseline = [e.id for e in lake.read_events(settings, limit=100).events]
+
+    # 过期版本：整次拒绝，连事件都不产生
+    stale = client.post(
+        "/api/batches",
+        data={"version": v - 1},
+        files={"file": ("a.csv", simple_csv(temp_c=1), "text/csv")},
+    )
+    assert stale.status_code == 409
+    assert [e.id for e in lake.read_events(settings, limit=100).events] == baseline
+
+    # 写盘失败：重试钩子后也不产生事件
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    real_write = pq.write_table
+    monkeypatch.setattr(lake.pq, "write_table", boom)
+    try:
+        failed = client.post(
+            "/api/batches",
+            data={"version": v},
+            files={"file": ("b.csv", simple_csv(temp_c=2), "text/csv")},
+        )
+    finally:
+        monkeypatch.setattr(lake.pq, "write_table", real_write)
+    assert failed.status_code == 500
+    assert [e.id for e in lake.read_events(settings, limit=100).events] == baseline
+    assert list(settings.parquet_dir.glob("*.parquet")) == []
+
+    # 随后正常上传仍是连续的下一条事件，中间没有空洞
+    ok = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": ("c.csv", simple_csv(temp_c=3), "text/csv")},
+    )
+    assert ok.status_code == 201, ok.text
+    events = lake.read_events(settings, limit=100).events
+    assert [e.id for e in events] == baseline + [baseline[-1] + 1]
+    assert events[-1].type == "batch_registered"
+    assert lake.check_integrity(settings).event_gaps == ()
